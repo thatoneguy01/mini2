@@ -1,0 +1,10 @@
+node_id,host,port,language,row,col,is_entry
+A,127.0.0.1,50051,cpp,0,0,true
+B,127.0.0.1,50052,python,0,1,false
+C,127.0.0.1,50053,python,0,2,false
+D,127.0.0.1,50054,python,1,0,false
+E,127.0.0.1,50055,python,1,1,false
+F,127.0.0.1,50056,python,1,2,false
+G,127.0.0.1,50057,python,2,0,false
+H,127.0.0.1,50058,python,2,1,false
+I,127.0.0.1,50059,python,2,2,false

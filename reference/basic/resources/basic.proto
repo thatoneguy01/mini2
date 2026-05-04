@@ -1,0 +1,51 @@
+syntax = "proto3";
+option java_multiple_files = true;
+option optimize_for = SPEED;
+package basic;
+
+import "google/protobuf/empty.proto";
+
+// ------------------------------------------------------------------------
+// example of a service using grpc (C++,python,?) service and client
+//
+// creates a simple tuple name-value-version, flat storage space.
+//
+// ------------------------------------------------------------------------
+
+
+service BasicService {
+   // blocking set of operations
+   rpc ping(google.protobuf.Empty) returns (google.protobuf.Empty) {}
+   rpc get(Ref) returns (Pair) {}
+   rpc put(Pair) returns (Ack) {}
+
+   // future operation
+   //rpc remove(Ref) returns (Ack) {}
+   //rpc list(google.protobuf.Empty) returns (ListOf) {}
+}
+
+// getting and putting data
+message Pair {
+  uint64 id = 1;                  // new values do not have IDs
+  string name = 3;                // unique not enforced
+  string value = 4;
+}
+
+// a stored pair abstraction/reference 
+message Ref {
+  uint64 id = 1; 
+}
+
+message Job {
+  uint64 id = 1; 
+  string payload = 2;
+}
+
+// acknowledgement of a request
+message Ack {
+  uint32 id = 1;
+  bool success = 2;
+  optional uint32 errorCode = 3;
+  optional string errorText = 4;
+}
+

@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package basecamp;
+
+message Job {
+  uint64 job_id = 1;
+  string query = 2;
+  int32 priority = 3;
+  bool requires_gpu = 4;
+  double cost_hint = 5;
+  string csv_row = 6;
+  uint32 csv_line_number = 7;
+}
+
+message SubmitJobsRequest {
+  string source_id = 1;
+  repeated Job jobs = 2;
+}
+
+message SubmitJobsReply {
+  uint32 accepted = 1;
+}
+
+message QueueStatusRequest {
+  string requester_id = 1;
+}
+
+message QueueStatusReply {
+  string node_id = 1;
+  uint32 queue_size = 2;
+}
+
+message QueueBroadcast {
+  string node_id = 1;
+  uint32 queue_size = 2;
+}
+
+message StealJobsRequest {
+  string requester_id = 1;
+  uint32 max_jobs = 2;
+}
+
+message StealJobsReply {
+  repeated Job jobs = 1;
+}
+
+message TickRequest {}
+
+message TickReply {
+  uint32 queue_size = 1;
+  uint32 stolen = 2;
+}
+
+message SnapshotRequest {}
+
+message NeighborSnapshot {
+  string node_id = 1;
+  uint32 queue_size = 2;
+}
+
+message SnapshotReply {
+  string node_id = 1;
+  uint32 queue_size = 2;
+  repeated NeighborSnapshot neighbors = 3;
+  uint32 consumed_count = 4;
+}
+
+message QueryResult {
+  int32 job_number = 1;
+  int32 doc_number = 2;
+  string borough = 3;
+  string job_type = 4;
+  string owner_business_name = 5;
+  string zip = 6;
+  string raw_csv_row = 7;
+}
+
+message QueryRequest {
+  string query_id = 1;
+  string query_filter = 2;
+}
+
+message BroadcastQueryRequest {
+  string query_id = 1;
+  string query_filter = 2;
+  string originating_node = 3;
+}
+
+message BroadcastQueryReply {
+  string node_id = 1;
+  repeated QueryResult local_results = 2;
+  repeated QueryResult aggregated_results = 3;
+}
+
+message QueryResponse {
+  string query_id = 1;
+  uint32 total_results = 2;
+  repeated QueryResult results = 3;
+}
+
+service BasecampNode {
+  rpc SubmitJobs(SubmitJobsRequest) returns (SubmitJobsReply);
+  rpc QueueStatus(QueueStatusRequest) returns (QueueStatusReply);
+  rpc BroadcastQueue(QueueBroadcast) returns (QueueStatusReply);
+  rpc StealJobs(StealJobsRequest) returns (StealJobsReply);
+  rpc Tick(TickRequest) returns (TickReply);
+  rpc GetSnapshot(SnapshotRequest) returns (SnapshotReply);
+  rpc SubmitQuery(QueryRequest) returns (QueryResponse);
+  rpc BroadcastQuery(BroadcastQueryRequest) returns (BroadcastQueryReply);
+}
