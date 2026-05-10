@@ -2,10 +2,10 @@
 param(
     [string]$ConfigPath = "config/grid_nodes.csv",
     [string]$LogDir = "logs",
-    [int]$StealBelow = 50,
+    [int]$StealBelow = 64,
     [int]$StealRatio = 2,
     [int]$MaxSteal = 500,
-    [float]$ProcessMs = 2,
+    [float]$ProcessMs = 0.1,
     [int]$RebalanceMs = 1,
     [int]$LogInterval = 1000,
     [int]$StartupDelay = 2
