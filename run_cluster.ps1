@@ -2,9 +2,43 @@
 param(
     [string]$ConfigPath = "config/grid_nodes.csv",
     [string]$LogDir = "logs",
+    [int]$StealBelow = 50,
+    [int]$StealRatio = 2,
+    [int]$MaxSteal = 500,
+    [float]$ProcessMs = 2,
+    [int]$RebalanceMs = 1,
     [int]$LogInterval = 1000,
     [int]$StartupDelay = 2
 )
+
+function Get-LatestQueueSizesFromLogs {
+    param(
+        [string[]]$NodeIds,
+        [string]$LogDirectory
+    )
+
+    $queueSizes = @{}
+    foreach ($nodeId in $NodeIds) {
+        $logPath = Join-Path $LogDirectory "node_$nodeId.log"
+        if (-not (Test-Path $logPath)) {
+            return $null
+        }
+
+        $lastLine = Get-Content $logPath -Tail 1 -ErrorAction SilentlyContinue
+        if ([string]::IsNullOrWhitespace($lastLine)) {
+            return $null
+        }
+
+        $parts = $lastLine.Split(',')
+        if ($parts.Count -lt 3) {
+            return $null
+        }
+
+        $queueSizes[$nodeId] = [int]$parts[2].Trim()
+    }
+
+    return $queueSizes
+}
 
 # Resolve paths relative to this script's directory when given as relative
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
@@ -19,6 +53,23 @@ if (-not [System.IO.Path]::IsPathRooted($LogDir)) {
 if (-not (Test-Path $LogDir)) {
     New-Item -ItemType Directory -Path $LogDir | Out-Null
     Write-Host "Created $LogDir directory"
+}
+
+# Ensure Python gRPC stubs exist before launching Python workers
+$pythonGeneratedDir = Join-Path $ScriptDir "python\generated"
+$pythonProtoGen = Join-Path $ScriptDir "python\build_proto.ps1"
+if (-not (Test-Path (Join-Path $pythonGeneratedDir "basecamp_pb2.py"))) {
+    if (Test-Path $pythonProtoGen) {
+        Write-Host "Generating Python gRPC stubs..." -ForegroundColor Yellow
+        & $pythonProtoGen
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "ERROR: Python protobuf generation failed." -ForegroundColor Red
+            exit 1
+        }
+    } else {
+        Write-Host "ERROR: Python protobuf generation script not found: $pythonProtoGen" -ForegroundColor Red
+        exit 1
+    }
 }
 
 # Read grid configuration
@@ -61,18 +112,27 @@ foreach ($nodeId in $nodeOrder) {
     
     if ($node.language -eq "cpp" -or $node.language -eq "C++") {
         # Start C++ server
-        $cppExe = Join-Path $ScriptDir "build\basecamp_cpp_server.exe"
+        $cppExe = Join-Path $ScriptDir "build\Release\basecamp_cpp_server.exe"
         if (-not (Test-Path $cppExe)) {
             Write-Host "  ERROR: $cppExe not found. Run CMake build first." -ForegroundColor Red
             continue
         }
+        $stdoutLog = Join-Path $LogDir "node_$nodeId.stdout.log"
+        $stderrLog = Join-Path $LogDir "node_$nodeId.stderr.log"
         $proc = Start-Process -FilePath $cppExe `
             -ArgumentList @(
                 "--node-id", $nodeId,
                 "--config", $ConfigPath,
+                "--steal-below", $StealBelow,
+                "--steal-ratio", $StealRatio,
+                "--max-steal", $MaxSteal,
+                "--process-ms", $ProcessMs,
+                "--rebalance-ms", $RebalanceMs,
                 "--log-file", $logFile,
                 "--log-interval", $LogInterval
             ) `
+            -RedirectStandardOutput $stdoutLog `
+            -RedirectStandardError $stderrLog `
             -PassThru `
             -WindowStyle Minimized
     } else {
@@ -84,6 +144,11 @@ foreach ($nodeId in $nodeOrder) {
                 $pythonScript,
                 "--node-id", $nodeId,
                 "--config", $ConfigPath,
+                "--steal-below", $StealBelow,
+                "--steal-ratio", $StealRatio,
+                "--max-steal", $MaxSteal,
+                "--process-ms", $ProcessMs,
+                "--rebalance-ms", $RebalanceMs,
                 "--log-file", $logFile,
                 "--log-interval", $LogInterval
             ) `
@@ -103,7 +168,7 @@ Start-Sleep -Seconds $StartupDelay
 Write-Host ""
 Write-Host "Launching client..." -ForegroundColor Green
 
-$cppClient = Join-Path $ScriptDir "build\basecamp_cpp_client.exe"
+$cppClient = Join-Path $ScriptDir "build\Release\basecamp_cpp_client.exe"
 if (Test-Path $cppClient) {
     # Run C++ client
     & $cppClient --config $ConfigPath
@@ -112,19 +177,33 @@ if (Test-Path $cppClient) {
 }
 
 Write-Host ""
-Write-Host "Client completed. Cluster is still running." -ForegroundColor Green
-Write-Host "Press Ctrl+C to stop all nodes." -ForegroundColor Yellow
+Write-Host "Client completed. Monitoring node queues for shutdown..." -ForegroundColor Green
+Write-Host "Cluster will stop when every node reports queue_size = 0." -ForegroundColor Yellow
 Write-Host "Log files: $LogDir/*.log" -ForegroundColor Gray
 
-# Keep script alive and monitor nodes
+$idlePollSeconds = [Math]::Max(1, [int][Math]::Ceiling($LogInterval / 1000.0))
+
+# Keep script alive and monitor nodes until all queues are empty
 try {
     while ($true) {
-        Start-Sleep -Seconds 5
+        Start-Sleep -Seconds $idlePollSeconds
+
+        $queueSizes = Get-LatestQueueSizesFromLogs -NodeIds $nodeOrder -LogDirectory $LogDir
+        if ($null -eq $queueSizes) {
+            continue
+        }
+
+        $allEmpty = $true
         foreach ($nodeId in $nodeOrder) {
-            $proc = $processes[$nodeId]
-            if ($proc.HasExited) {
-                Write-Host "Node $nodeId has exited (exit code: $($proc.ExitCode))" -ForegroundColor Red
+            if ($queueSizes[$nodeId] -ne 0) {
+                $allEmpty = $false
+                break
             }
+        }
+
+        if ($allEmpty) {
+            Write-Host "All nodes report queue_size = 0. Stopping cluster..." -ForegroundColor Green
+            break
         }
     }
 } finally {

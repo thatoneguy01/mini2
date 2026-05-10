@@ -1,4 +1,3 @@
-print("===========================================================================================================Starting node server...", flush=True)
 import argparse
 import collections
 import csv
@@ -17,7 +16,6 @@ import grpc
 from generated import basecamp_pb2
 from generated import basecamp_pb2_grpc
 
-print("===========================================================================================================Imports complete, starting main...", flush=True)  
 
 # Global server handle used by signal handlers for graceful shutdown
 GLOBAL_SERVER = None
@@ -65,10 +63,11 @@ def neighbors_for(nodes, node_id):
 
 
 class BasecampServicer(basecamp_pb2_grpc.BasecampNodeServicer):
-    def __init__(self, node, nodes, steal_below, max_steal, process_ms, rebalance_ms, log_file="", log_interval_ms=1000):
+    def __init__(self, node, nodes, steal_below, steal_ratio, max_steal, process_ms, rebalance_ms, log_file="", log_interval_ms=1000):
         self.node = node
         self.nodes = nodes
         self.steal_below = steal_below
+        self.steal_ratio = steal_ratio
         self.max_steal = max_steal
         self.process_ms = process_ms
         self.rebalance_ms = rebalance_ms
@@ -90,10 +89,15 @@ class BasecampServicer(basecamp_pb2_grpc.BasecampNodeServicer):
             self.stubs[neighbor.node_id] = basecamp_pb2_grpc.BasecampNodeStub(channel)
             self.last_seen[neighbor.node_id] = 0
 
-        logging.debug(f"[{self.node.node_id}] initialized with {len(self.neighbors)} neighbors")
+        #logging.debug(f"[{self.node.node_id}] initialized with {len(self.neighbors)} neighbors")
 
+        # Start worker thread for consuming jobs
         self.worker = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker.start()
+
+        # Start rebalance thread for stealing and broadcasting
+        self.rebalancer = threading.Thread(target=self._rebalance_loop, daemon=True)
+        self.rebalancer.start()
 
         if self.log_file:
             self.logging_thread = threading.Thread(target=self._logging_loop, daemon=True)
@@ -122,11 +126,14 @@ class BasecampServicer(basecamp_pb2_grpc.BasecampNodeServicer):
         return basecamp_pb2.QueueStatusReply(node_id=self.node.node_id, queue_size=self._queue_size())
 
     def StealJobs(self, request, context):
+        # AcceptStealJobs: Give jobs to requester without pre-checks.
+        # The requester's decision to steal is based on cached queue size info.
         jobs = []
         with self.lock:
             steal_n = min(int(request.max_jobs), len(self.queue))
             for _ in range(steal_n):
-                jobs.append(self.queue.popleft())
+                if self.queue:
+                    jobs.append(self.queue.pop())
         return basecamp_pb2.StealJobsReply(jobs=jobs)
 
     def Tick(self, request, context):
@@ -375,47 +382,48 @@ class BasecampServicer(basecamp_pb2_grpc.BasecampNodeServicer):
                 continue
 
     def _refresh_neighbor_sizes(self):
-        for node_id, stub in self.stubs.items():
-            try:
-                reply = stub.QueueStatus(basecamp_pb2.QueueStatusRequest(requester_id=self.node.node_id), timeout=0.5)
-                with self.lock:
-                    self.last_seen[node_id] = reply.queue_size
-            except grpc.RpcError:
-                continue
+        # DEPRECATED: Nodes no longer poll. They broadcast and cache instead.
+        pass
 
     def _rebalance_once(self):
+        # Try to steal from the neighbor with the largest known queue.
+        # If steal_ratio is 0, use max_steal cap. Otherwise use ratio-based calculation.
         local = self._queue_size()
-        self._broadcast_queue_size(local)
-        if local >= self.steal_below:
-            return 0
-
-        self._refresh_neighbor_sizes()
+        
         with self.lock:
             if not self.last_seen:
                 return 0
             donor_id = max(self.last_seen, key=self.last_seen.get)
             donor_size = int(self.last_seen[donor_id])
-
-        if donor_size <= local + 1:
+        
+        # Skip if we have enough work or donor is empty
+        if local >= self.steal_below or donor_size == 0:
             return 0
-
-        want = max(1, (donor_size - local) // 2)
-        request_n = min(self.max_steal, want)
-
+        
+        # Calculate how many jobs to request
+        if self.steal_ratio == 0:
+            # Use max_steal cap (traditional behavior)
+            want = max(1, (donor_size - local) // 2)
+            request_n = min(self.max_steal, want)
+        else:
+            # Use steal_ratio calculation
+            want = max(1, (donor_size - local) // self.steal_ratio)
+            request_n = want
+        
         try:
             response = self.stubs[donor_id].StealJobs(
-                basecamp_pb2.StealJobsRequest(requester_id=self.node.node_id, max_jobs=request_n), timeout=0.8
+                basecamp_pb2.StealJobsRequest(requester_id=self.node.node_id, max_jobs=request_n), 
+                timeout=0.8
             )
         except grpc.RpcError:
             return 0
-
+        
         with self.lock:
             for job in response.jobs:
                 self.queue.append(job)
         return len(response.jobs)
 
     def _worker_loop(self):
-        next_rebalance = time.time() + (self.rebalance_ms / 1000.0)
         while self.running:
             did_work = False
             consumed_job = None
@@ -440,12 +448,17 @@ class BasecampServicer(basecamp_pb2_grpc.BasecampNodeServicer):
             else:
                 time.sleep(0.05)
 
-            now = time.time()
-            if now >= next_rebalance:
-                stolen = self._rebalance_once()
-                if stolen > 0:
-                    print(f"[{self.node.node_id}] stole {stolen} jobs", flush=True)
-                next_rebalance = now + (self.rebalance_ms / 1000.0)
+    def _rebalance_loop(self):
+        # Separate thread: periodically broadcast queue size and attempt to steal.
+        while self.running:
+            local_size = self._queue_size()
+            # Broadcast local queue size to neighbors
+            self._broadcast_queue_size(local_size)
+            # Attempt to steal from the neighbor with the largest known queue
+            stolen = self._rebalance_once()
+            if stolen > 0:
+                print(f"[{self.node.node_id}] stole {stolen} jobs", flush=True)
+            time.sleep(self.rebalance_ms / 1000.0)
 
     def _logging_loop(self):
         next_log = time.time() + (self.log_interval_ms / 1000.0)
@@ -463,11 +476,12 @@ class BasecampServicer(basecamp_pb2_grpc.BasecampNodeServicer):
         try:
             with open(self.log_file, "a") as f:
                 if not file_exists:
-                    f.write("timestamp_us,node_id,queue_size\n")
+                    f.write("timestamp_us,node_id,queue_size,jobs_processed\n")
 
                 timestamp_us = int(time.time() * 1_000_000)
                 qsize = self._queue_size()
-                f.write(f"{timestamp_us},{self.node.node_id},{qsize}\n")
+                jobs_processed = len(self.consumed_tasks)
+                f.write(f"{timestamp_us},{self.node.node_id},{qsize},{jobs_processed}\n")
                 f.flush()
         except IOError:
             pass
@@ -477,9 +491,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--node-id", required=True)
     parser.add_argument("--config", default="config/grid_nodes.csv")
-    parser.add_argument("--steal-below", type=int, default=2)
-    parser.add_argument("--max-steal", type=int, default=4)
-    parser.add_argument("--process-ms", type=int, default=150)
+    parser.add_argument("--steal-below", type=int, default=50)
+    parser.add_argument("--steal-ratio", type=int, default=0)
+    parser.add_argument("--max-steal", type=int, default=500)
+    parser.add_argument("--process-ms", type=float, default=0.1)
     parser.add_argument("--rebalance-ms", type=int, default=1000)
     parser.add_argument("--log-file", default="")
     parser.add_argument("--log-interval", type=int, default=1000)
@@ -509,6 +524,7 @@ def main():
         node=node,
         nodes=nodes,
         steal_below=args.steal_below,
+        steal_ratio=args.steal_ratio,
         max_steal=args.max_steal,
         process_ms=args.process_ms,
         rebalance_ms=args.rebalance_ms,
@@ -539,7 +555,7 @@ def main():
         global GLOBAL_SERVER
         server.start()
         GLOBAL_SERVER = server
-        logging.info(f"Node {node.node_id} listening on {node.port}")
+        #logging.info(f"Node {node.node_id} listening on {node.port}")
         print(f"Node {node.node_id} listening on {node.port}", flush=True)
         server.wait_for_termination()
     except Exception:
@@ -549,7 +565,8 @@ def main():
             servicer.running = False
         except Exception:
             pass
-        logging.info(f"Node {node.node_id} shutting down")
+        jobs_processed = len(servicer.consumed_tasks)
+        logging.info(f"Node {node.node_id} shutting down (processed {jobs_processed} jobs)")
 
 
 if __name__ == "__main__":

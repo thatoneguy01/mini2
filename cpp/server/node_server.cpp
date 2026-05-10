@@ -25,11 +25,12 @@ namespace {
 class NodeServiceImpl final : public basecamp::BasecampNode::Service {
  public:
   NodeServiceImpl(basecamp::NodeInfo self, basecamp::GridConfig config, int steal_when_below,
-                  int max_steal_batch, int process_ms, int rebalance_ms,
+                  int steal_ratio, int max_steal_batch, int process_ms, int rebalance_ms,
                   const std::string& log_file, int log_interval_ms)
       : self_(std::move(self)),
         config_(std::move(config)),
         steal_when_below_(steal_when_below),
+        steal_ratio_(steal_ratio),
         max_steal_batch_(max_steal_batch),
         process_ms_(process_ms),
         rebalance_ms_(rebalance_ms),
@@ -46,6 +47,7 @@ class NodeServiceImpl final : public basecamp::BasecampNode::Service {
   void StartBackgroundLoops() {
     running_ = true;
     worker_thread_ = std::thread([this]() { WorkerLoop(); });
+    rebalancer_thread_ = std::thread([this]() { RebalanceLoop(); });
     if (!log_file_.empty()) {
       logging_thread_ = std::thread([this]() { LoggingLoop(); });
     }
@@ -56,6 +58,9 @@ class NodeServiceImpl final : public basecamp::BasecampNode::Service {
     if (worker_thread_.joinable()) {
       worker_thread_.join();
     }
+    if (rebalancer_thread_.joinable()) {
+      rebalancer_thread_.join();
+    }
     if (logging_thread_.joinable()) {
       logging_thread_.join();
     }
@@ -63,18 +68,17 @@ class NodeServiceImpl final : public basecamp::BasecampNode::Service {
 
   grpc::Status SubmitJobs(grpc::ServerContext*, const basecamp::SubmitJobsRequest* request,
                           basecamp::SubmitJobsReply* reply) override {
-    std::lock_guard<std::mutex> lock(mu_);
-    for (const auto& job : request->jobs()) {
-      queue_.push_back(job);
+    // const auto t_start = std::chrono::steady_clock::now();
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      for (const auto& job : request->jobs()) {
+        queue_.push_back(job);
+      }
     }
+    // const auto t_end = std::chrono::steady_clock::now();
+    // const auto us = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
+    // std::cerr << "[" << self_.node_id << "] SubmitJobs lock held_us=" << us << " num=" << request->jobs_size() << std::endl;
     reply->set_accepted(static_cast<uint32_t>(request->jobs_size()));
-    return grpc::Status::OK;
-  }
-
-  grpc::Status QueueStatus(grpc::ServerContext*, const basecamp::QueueStatusRequest*,
-                           basecamp::QueueStatusReply* reply) override {
-    reply->set_node_id(self_.node_id);
-    reply->set_queue_size(static_cast<uint32_t>(QueueSize()));
     return grpc::Status::OK;
   }
 
@@ -91,13 +95,30 @@ class NodeServiceImpl final : public basecamp::BasecampNode::Service {
 
   grpc::Status StealJobs(grpc::ServerContext*, const basecamp::StealJobsRequest* request,
                          basecamp::StealJobsReply* reply) override {
-    std::lock_guard<std::mutex> lock(mu_);
-    const auto steal_count = std::min(static_cast<size_t>(request->max_jobs()), queue_.size());
-    for (size_t i = 0; i < steal_count; ++i) {
-      auto* job = reply->add_jobs();
-      *job = queue_.front();
-      queue_.pop_front();
+    // AcceptStealJobs: Give jobs to requester without pre-checks.
+    // The requester's decision to steal is based on cached queue size info.
+    // const auto t_start = std::chrono::steady_clock::now();
+    std::vector<basecamp::Job> stolen_jobs;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      const size_t steal_count = std::min(static_cast<size_t>(request->max_jobs()), queue_.size());
+      for (size_t i = 0; i < steal_count; ++i) {
+        stolen_jobs.push_back(queue_.back());
+        queue_.pop_back();
+      }
     }
+    // const auto t_lock_end = std::chrono::steady_clock::now();
+    
+    // Add jobs to reply outside the lock (protobuf serialization is expensive)
+    for (const auto& job : stolen_jobs) {
+      auto* reply_job = reply->add_jobs();
+      *reply_job = job;
+    }
+    
+    // const auto t_end = std::chrono::steady_clock::now();
+    // const auto lock_us = std::chrono::duration_cast<std::chrono::microseconds>(t_lock_end - t_start).count();
+    // const auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
+    // std::cerr << "[" << self_.node_id << "] StealJobs lock_us=" << lock_us << " total_us=" << total_us << " num=" << stolen_jobs.size() << std::endl;
     return grpc::Status::OK;
   }
 
@@ -244,13 +265,11 @@ class NodeServiceImpl final : public basecamp::BasecampNode::Service {
 
   int RebalanceOnce() {
     const int local_queue_size = static_cast<int>(QueueSize());
-    BroadcastLocalQueueSize(local_queue_size);
 
+    // Skip if we have enough work
     if (local_queue_size >= steal_when_below_) {
       return 0;
     }
-
-    RefreshNeighborQueueSizes();
 
     std::optional<std::string> best_neighbor;
     int best_size = -1;
@@ -264,12 +283,20 @@ class NodeServiceImpl final : public basecamp::BasecampNode::Service {
       }
     }
 
-    if (!best_neighbor.has_value() || best_size <= local_queue_size + 1) {
+    // Skip if no neighbor info or donor is empty
+    if (!best_neighbor.has_value() || best_size == 0) {
       return 0;
     }
 
-    const int desired = std::max(1, (best_size - local_queue_size) / 2);
-    const int request_count = std::min(max_steal_batch_, desired);
+    int request_count;
+    if (steal_ratio_ == 0) {
+      // Use max_steal_batch cap (traditional behavior)
+      const int desired = std::max(1, (best_size - local_queue_size) / 2);
+      request_count = std::min(max_steal_batch_, desired);
+    } else {
+      // Use steal_ratio calculation
+      request_count = std::max(1, (best_size - local_queue_size) / steal_ratio_);
+    }
 
     auto stub_it = neighbor_stubs_.find(*best_neighbor);
     if (stub_it == neighbor_stubs_.end()) {
@@ -287,14 +314,23 @@ class NodeServiceImpl final : public basecamp::BasecampNode::Service {
       return 0;
     }
 
+    // Instrument lock hold while inserting stolen jobs into our queue
+    // const auto t_start = std::chrono::steady_clock::now();
+    // size_t inserted = 0;
     {
       std::lock_guard<std::mutex> lock(mu_);
       for (const auto& job : response.jobs()) {
         queue_.push_back(job);
+        // ++inserted;
       }
     }
+    // const auto t_end = std::chrono::steady_clock::now();
+    // const auto us = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
+    // if (inserted > 0) {
+      // std::cerr << "[" << self_.node_id << "] Rebalance insert lock_us=" << us << " inserted=" << inserted << std::endl;
+    // }
 
-    return response.jobs_size();
+    return static_cast<int>(response.jobs_size());
   }
 
   void BroadcastLocalQueueSize(int local_queue_size) {
@@ -313,23 +349,10 @@ class NodeServiceImpl final : public basecamp::BasecampNode::Service {
   }
 
   void RefreshNeighborQueueSizes() {
-    for (auto& [neighbor_id, stub] : neighbor_stubs_) {
-      grpc::ClientContext ctx;
-      basecamp::QueueStatusRequest request;
-      request.set_requester_id(self_.node_id);
-
-      basecamp::QueueStatusReply response;
-      const grpc::Status status = stub->QueueStatus(&ctx, request, &response);
-      if (status.ok()) {
-        std::lock_guard<std::mutex> lock(mu_);
-        last_seen_queue_size_[neighbor_id] = response.queue_size();
-      }
-    }
+    // DEPRECATED: Nodes no longer poll. They broadcast and cache instead.
   }
 
   void WorkerLoop() {
-    auto next_rebalance = std::chrono::steady_clock::now() + std::chrono::milliseconds(rebalance_ms_);
-
     while (running_) {
       bool did_work = false;
       basecamp::Job consumed_job;
@@ -357,15 +380,20 @@ class NodeServiceImpl final : public basecamp::BasecampNode::Service {
       } else {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
       }
+    }
+  }
 
-      const auto now = std::chrono::steady_clock::now();
-      if (now >= next_rebalance) {
-        const int stolen = RebalanceOnce();
-        if (stolen > 0) {
-          std::cout << "[" << self_.node_id << "] stole " << stolen << " jobs" << std::endl;
-        }
-        next_rebalance = now + std::chrono::milliseconds(rebalance_ms_);
-      }
+  void RebalanceLoop() {
+    // Separate thread: periodically broadcast queue size and attempt to steal.
+
+    while (running_) {
+      const int local_size = static_cast<int>(QueueSize());
+      BroadcastLocalQueueSize(local_size);
+      // const int stolen = RebalanceOnce();
+      // if (stolen > 0) {
+      //   std::cout << "[" << self_.node_id << "] stole " << stolen << " jobs" << std::endl;
+      // }
+      std::this_thread::sleep_for(std::chrono::milliseconds(rebalance_ms_));
     }
   }
 
@@ -397,7 +425,7 @@ class NodeServiceImpl final : public basecamp::BasecampNode::Service {
     }
 
     if (!file_exists) {
-      log << "timestamp_us,node_id,queue_size\n";
+      log << "timestamp_us,node_id,queue_size,jobs_processed\n";
     }
 
     const auto now = std::chrono::system_clock::now();
@@ -405,13 +433,15 @@ class NodeServiceImpl final : public basecamp::BasecampNode::Service {
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
     
     const int qsize = QueueSize();
-    log << us << "," << self_.node_id << "," << qsize << "\n";
+    const int jobs_processed = static_cast<int>(consumed_tasks_.size());
+    log << us << "," << self_.node_id << "," << qsize << "," << jobs_processed << "\n";
     log.flush();
   }
 
   const basecamp::NodeInfo self_;
   const basecamp::GridConfig config_;
   const int steal_when_below_;
+  const int steal_ratio_;
   const int max_steal_batch_;
   const int process_ms_;
   const int rebalance_ms_;
@@ -428,6 +458,7 @@ class NodeServiceImpl final : public basecamp::BasecampNode::Service {
 
   bool running_ = false;
   std::thread worker_thread_;
+  std::thread rebalancer_thread_;
   std::thread logging_thread_;
 };
 
@@ -449,14 +480,24 @@ int ArgValueInt(int argc, char** argv, const std::string& name, int fallback) {
   return fallback;
 }
 
+float ArgValueFloat(int argc, char** argv, const std::string& name, float fallback) {
+  for (int i = 1; i < argc - 1; ++i) {
+    if (name == argv[i]) {
+      return std::stof(argv[i + 1]);
+    }
+  }
+  return fallback;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   const std::string node_id = ArgValue(argc, argv, "--node-id", "");
   const std::string config_path = ArgValue(argc, argv, "--config", "config/grid_nodes.csv");
-  const int steal_when_below = ArgValueInt(argc, argv, "--steal-below", 2);
-  const int max_steal_batch = ArgValueInt(argc, argv, "--max-steal", 4);
-  const int process_ms = ArgValueInt(argc, argv, "--process-ms", 150);
+  const int steal_when_below = ArgValueInt(argc, argv, "--steal-below", 50);
+  const int steal_ratio = ArgValueInt(argc, argv, "--steal-ratio", 0);
+  const int max_steal_batch = ArgValueInt(argc, argv, "--max-steal", 500);
+  const float process_ms = ArgValueFloat(argc, argv, "--process-ms", 0.1);
   const int rebalance_ms = ArgValueInt(argc, argv, "--rebalance-ms", 1000);
   const std::string log_file = ArgValue(argc, argv, "--log-file", "");
   const int log_interval_ms = ArgValueInt(argc, argv, "--log-interval", 1000);
@@ -479,7 +520,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  NodeServiceImpl service(*self, config, steal_when_below, max_steal_batch, process_ms, rebalance_ms,
+  NodeServiceImpl service(*self, config, steal_when_below, steal_ratio, max_steal_batch, process_ms, rebalance_ms,
                          log_file, log_interval_ms);
   service.StartBackgroundLoops();
 
